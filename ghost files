@@ -1,0 +1,868 @@
+// ==UserScript==
+// @name         Sorting Hat: Bulk Search ASINs and POs
+// @namespace    https://tampermonkey.net/
+// @version      2.3.1
+// @description  Bulk search ASINs in Sorting Hat. Pull ASINS from POs from FCResearch and bulk search. Being logged into FCMenu is required to pull from POs.
+// @match        https://iris-diagonalley.agl.amazon.dev/dc-marauders-map/HSE1/sorting-hat
+// @match        https://fcresearch-na.aka.amazon.com/*/results*
+// @run-at       document-idle
+// @grant        GM_openInTab
+// @grant        GM_setValue
+// @grant        GM_addValueChangeListener
+// @grant        GM_removeValueChangeListener
+// ==/UserScript==
+(() => {
+  'use strict';
+
+  // Fresh mount every run (prevents stale UI / dead listeners)
+  ['sh15-root','sh15r-root'].forEach(id => { const n = document.getElementById(id); if (n) n.remove(); });
+
+  const IS_FCRESEARCH  = /^fcresearch-.*\.aka\.amazon\.com$/i.test(location.hostname);
+  const IS_SORTING_HAT = /iris-diagonalley\.agl\.amazon\.dev$/i.test(location.hostname) && /\/sorting-hat/i.test(location.pathname);
+
+  // ===================== FCResearch (background bridge that scrapes ASINs + Titles) =====================
+  if (IS_FCRESEARCH) {
+    const u = new URL(location.href);
+    const channel = new URLSearchParams(u.hash.replace(/^#/, '')).get('shBridge') || u.searchParams.get('shBridge') || '';
+
+    const extractWHFromURL = () => (location.pathname.split('/').filter(Boolean)[0] || '');
+    const getPO = () => new URL(location.href).searchParams.get('s') || '';
+
+    function uniqueASINsFromText(text) {
+      const rx = /\bB0[0-9A-Z]{8}\b/gi, out = new Set();
+      if (!text) return [];
+      let m; const up = text.toUpperCase();
+      while ((m = rx.exec(up)) !== null) out.add(m[0]);
+      return [...out];
+    }
+    function extractPairsFromTable(){
+      const out = [];
+      document.querySelectorAll('#table-purchase-order-item tbody tr').forEach(tr => {
+        const asin = (tr.querySelector('td:nth-child(2) a')?.textContent || '').trim().toUpperCase();
+        const title = (tr.querySelector('td:nth-child(8) a')?.textContent || '').trim();
+        if (/^B0[0-9A-Z]{8}$/.test(asin)) out.push({ asin, title });
+      });
+      return out;
+    }
+    function extractAsinTitlePairs() {
+      const pairs = extractPairsFromTable();
+      if (pairs.length) return pairs;
+      const asins = uniqueASINsFromText(document.body?.innerText || '');
+      return asins.map(a => ({ asin: a, title: '' }));
+    }
+    function findLoginURL() {
+      const a = document.querySelector('a[href*="openid/login"], a[href*="/openId/login"], a[href*="open-id/login"]');
+      if (a?.href) return a.href;
+      const f = document.querySelector('form[action*="openid/login"], form[action*="/openId/login"], form[action*="open-id/login"]');
+      if (f?.action) return f.action;
+      return '';
+    }
+    function looksLikeLogin() {
+      if (document.querySelector('#table-purchase-order-item')) return false;
+      const html = document.documentElement.innerHTML;
+      return /openid\/login/i.test(html) || /(sso|signin|sign-in|okta|authenticate)/i.test(html);
+    }
+    const bridgeSend = (payload) => { if (channel) GM_setValue(`sh15.poRes.${channel}`, payload); };
+
+    (async () => {
+      if (!channel) return;
+      const wh = extractWHFromURL();
+      const po = getPO();
+
+      const MAX_WAIT = 8000, start = Date.now();
+      if (!document.querySelector('#table-purchase-order-item')) {
+        await new Promise(resolve => {
+          const mo = new MutationObserver(() => {
+            if (document.querySelector('#table-purchase-order-item')) { mo.disconnect(); resolve(true); }
+            else if (Date.now() - start > MAX_WAIT) { mo.disconnect(); resolve(false); }
+          });
+          mo.observe(document.body, {subtree:true, childList:true});
+          setTimeout(()=>{ try{ mo.disconnect(); }catch{} resolve(false); }, MAX_WAIT);
+        });
+      }
+
+      let pairs = extractAsinTitlePairs();
+      if (!pairs.length) { await new Promise(r=>setTimeout(r,300)); pairs = extractAsinTitlePairs(); }
+
+      const asins = pairs.map(p => p.asin);
+      const loginURL = findLoginURL();
+      const loginRequired = (!asins.length) && (looksLikeLogin() || /openid\/login/i.test(loginURL));
+
+      await bridgeSend({
+        ok: asins.length>0,
+        loginRequired, loginURL,
+        asins, pairs, count: asins.length, wh, po, url: location.href, ts: Date.now()
+      });
+      setTimeout(()=>{ try{ window.close(); }catch{} }, 500);
+    })();
+    return;
+  }
+
+  // ===================== Sorting Hat (main UI) =====================
+  if (!IS_SORTING_HAT) return;
+
+  // ---- Config (pacing + resilience) ----
+  const REGION_ID            = 1;
+  const BASE_DELAY_MS        = 1500;  // per-ASIN delay (adjust if needed)
+  const JITTER_MS            = 300;   // ± jitter
+  const MAX_RETRIES          = 2;
+  const BACKOFF_BASE_MS      = 800;
+  const REQ_TIMEOUT_MS       = 15000;
+  const BREAKER_THRESHOLD    = 5;
+  const BREAKER_COOLDOWN_MS  = 15000;
+  const PASSES_FOR_REQUEUE   = 2;
+  const PASS_COOLDOWN_MS     = 12000;
+  const PO_DELAY_MS          = 800;   // delay between PO imports
+  const IMPORT_TIMEOUT_MS    = 12000;
+  const API_PATH             = '/api/sortingHatCheckAsin';
+
+  // ---- Helpers ----
+  const sleep = (ms)=>new Promise(r=>setTimeout(r,ms));
+  const withJitter = (ms)=>Math.max(0, ms + Math.floor((Math.random()*2 - 1) * JITTER_MS));
+  const parseTokens = raw => Array.from(new Set((raw||'').split(/[\n,\s\t]+/).map(s=>s.trim()).filter(Boolean)));
+  const parseBarcodes = parseTokens;
+  const parsePOs      = parseTokens;
+  const escJSON = obj => encodeURIComponent(JSON.stringify(obj));
+  function hex(n){ let s=''; for(let i=0;i<n;i++) s += Math.floor(Math.random()*16).toString(16); return s; }
+  function genTraceId(){ return `Root=1-${hex(8)}-${hex(24)};Parent=${hex(16)};Sampled=1`; }
+  function makeURL(warehouseId, barcode){
+    const input = { regionId: REGION_ID, warehouseId: String(warehouseId), scannedBarcode: String(barcode) };
+    return `${location.origin}${API_PATH}?input=${escJSON(input)}`;
+  }
+  const fcresearchUrl = (wh, poOrAsin) =>
+    `https://fcresearch-na.aka.amazon.com/${encodeURIComponent(wh)}/results?s=${encodeURIComponent(poOrAsin)}`;
+
+  // ---- Build UIs ----
+  const root = document.createElement('div');
+  root.id = 'sh15-root';
+  const resultsRoot = document.createElement('div');
+  resultsRoot.id = 'sh15r-root';
+
+  root.innerHTML = `
+  <style>
+    :root { --amz-navy:#232F3E; --amz-orange:#FF9900; --amz-red:#B12704; --amz-green:#007600;
+            --amz-bg:#FFFFFF; --amz-text:#111111; --amz-border:#D5D9D9; --amz-muted:#565959; --amz-th:#F3F3F3; }
+
+    #sh15, #sh15r { position:fixed; z-index:2147483647; background:var(--amz-bg); color:var(--amz-text);
+                    border:1px solid var(--amz-border); border-radius:12px;
+                    font:13px/1.35 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;
+                    box-shadow:0 8px 24px rgba(0,0,0,.18); display:flex; flex-direction:column; overflow:hidden; resize: both; }
+    /* Control panel */
+    #sh15 { top:16px; right:16px; width:460px; height:560px; min-width:360px; min-height:320px; max-width:95vw; max-height:85vh; }
+    /* Results window */
+    #sh15r { top:80px; right:500px; width:600px; height:520px; min-width:420px; min-height:260px; max-width:95vw; max-height:85vh; display:none; }
+
+    #sh15 header, #sh15r header { display:flex; align-items:center; justify-content:space-between; gap:8px; padding:10px 12px;
+                                  background:var(--amz-navy); color:#fff; user-select:none; cursor:move; white-space:nowrap; }
+    #sh15 header strong, #sh15r header strong { font-weight:700; letter-spacing:.2px }
+    #sh15 header button, #sh15r header button { background:transparent; border:0; color:#fff; opacity:.9; cursor:pointer }
+    #sh15 header button:hover, #sh15r header button:hover { opacity:1 }
+
+    #sh15 .body{ flex:0 0 auto; padding:12px; display:grid; gap:10px; overflow:auto; }
+    #sh15 .row{ display:grid; gap:6px; min-height:0; }
+    #sh15 label{ font-size:12px; color:var(--amz-muted) }
+    #sh15 textarea{ resize:vertical; min-height:100px; max-height:240px; padding:10px; border-radius:8px; border:1px solid var(--amz-border);
+                    background:#fff; color:var(--amz-text); font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; font-size:12.5px }
+    #sh15 input[type="text"]{ width:100%; padding:8px 10px; border-radius:8px; border:1px solid var(--amz-border); background:#fff; color:#111; }
+    #sh15 input[readonly]{ background:#f6f6f6; color:var(--amz-muted); cursor:not-allowed }
+    #sh15 .controls{ display:flex; gap:8px; flex-wrap:wrap }
+    #sh15 .controls button{ flex:1; padding:9px 12px; border-radius:8px; border:1px solid var(--amz-border); cursor:pointer }
+    #sh15 .controls button.primary{ background:var(--amz-orange); color:#111; border-color:#e08800 }
+    #sh15 .controls button.primary:hover{ filter:brightness(0.98) }
+    #sh15 .controls button.warn{ background:var(--amz-red); color:#fff; border-color:#922103 }
+    #sh15 .controls button.warn:hover{ filter:brightness(0.98) }
+    #sh15 .controls button:disabled{ opacity:.55; cursor:not-allowed }
+
+    /* Results region (docked or popped) */
+    #sh15-dock{ flex:1 1 auto; min-height:120px; overflow:auto; border-top:1px solid var(--amz-border) }
+    #sh15r .body{ flex:1 1 auto; display:flex; flex-direction:column; min-height:0; }
+    #sh15r-table-wrap{ flex:1 1 auto; overflow:auto; border-top:1px solid var(--amz-border); background:#fff; }
+
+    /* Table */
+    .sh15-table{ width:100%; border-collapse:collapse; font-size:12.5px; table-layout:fixed; }
+    .sh15-table th, .sh15-table td { padding:8px 10px; border-bottom:1px solid var(--amz-border);
+                                     white-space:nowrap; text-overflow:ellipsis; overflow:hidden }
+    .sh15-table th{ position:sticky; top:0; background:var(--amz-th); z-index:1 }
+    .sh15-table a{ color:#0f62fe; text-decoration:none; }
+    .sh15-table a:hover{ text-decoration:underline; }
+
+    /* Title column clamp + expand */
+    .sh15-title { width:22%; white-space:normal; }
+    .sh15-title .t{
+      display:-webkit-box; -webkit-box-orient:vertical; -webkit-line-clamp:2;
+      overflow:hidden; word-break:break-word;
+    }
+    .sh15-title .t.expanded{ display:block; -webkit-line-clamp:unset; white-space:normal; }
+    .sh15-title .moreless{ margin-left:6px; color:#0f62fe; cursor:pointer; font-size:11.5px; user-select:none; }
+
+    /* Pills */
+    .pill{ display:inline-block; padding:2px 8px; border-radius:999px; font-size:11.5px; font-weight:600; line-height:1 }
+    .ok{ background:#E7F3EC; color:var(--amz-green); border:1px solid #9fd5b2 }
+    .bad{ background:#FDEFEA; color:var(--amz-red); border:1px solid #e0a295 }
+
+    /* Footers */
+    #sh15 .footer{ flex:0 0 auto; display:flex; align-items:center; justify-content:space-between; gap:8px; padding:8px 12px;
+                   background:#fafafa; border-top:1px solid var(--amz-border) }
+    #sh15 .tiny{ font-size:11px; color:var(--amz-muted) }
+    #sh15r .footer{ flex:0 0 auto; padding:6px 10px; background:#fafafa; border-top:1px solid var(--amz-border); display:flex; gap:10px; align-items:center; }
+    #sh15r .tiny{ font-size:11px; color:#eaeaea; }
+
+    /* Collapsed (mini) mode — force size to header-only */
+    #sh15.collapsed, #sh15r.collapsed{ width:auto !important; height:auto !important; min-width:0 !important; min-height:0 !important; resize:none; }
+    #sh15.collapsed header, #sh15r.collapsed header{ padding:6px 10px; border-radius:10px; cursor:move }
+    #sh15.collapsed .body, #sh15.collapsed #sh15-dock, #sh15.collapsed .footer{ display:none !important; }
+    #sh15r.collapsed .body, #sh15r.collapsed .footer{ display:none !important; }
+
+    /* Mini titles */
+    .mini-title{ display:none; font-size:12px; color:#fff; opacity:.9 }
+    #sh15.collapsed .mini-title, #sh15r.collapsed .mini-title{ display:inline }
+  </style>
+
+  <section id="sh15">
+    <header id="sh15-drag" title="Drag to move • Double-click to toggle mini mode (R toggles results)">
+      <strong><span class="full-title">Sorting Hat Bulk Scan</span><span class="mini-title">Bulk Scan (minimized)</span></strong>
+      <div><button id="sh15-min" title="Minimize">–</button><button id="sh15-x" title="Close">✕</button></div>
+    </header>
+    <div class="body">
+      <div class="row">
+        <label>Barcodes (one per line or comma-separated)</label>
+        <textarea id="sh15-input" placeholder="B07XKCKGZ5\nB0ABC12345, B0XYZ67890"></textarea>
+      </div>
+
+      <div class="row">
+        <label>Warehouse ID (auto-detected)</label>
+        <input id="sh15-warehouse" type="text" placeholder="— not detected —" readonly title="Auto-detected from URL (with a light DOM fallback)">
+      </div>
+
+      <div class="row">
+        <label>PO(s) (import ASINs from FCResearch)</label>
+        <div class="controls">
+          <input id="sh15-po" type="text" placeholder="e.g., 1BLDPQDQ, 2ABC1234 or line-separated" style="flex:2;">
+          <button id="sh15-import" class="primary" style="flex:1;">Import from FCResearch</button>
+        </div>
+        <div class="tiny" id="sh15-import-status"></div>
+      </div>
+
+      <div class="row">
+        <label style="display:flex; gap:14px; align-items:center; flex-wrap:wrap;">
+          <span><input type="checkbox" id="sh15-detach"> Pop out results</span>
+          <span><input type="checkbox" id="sh15-autoopen"> Auto-open results on Start</span>
+        </label>
+      </div>
+
+      <div class="controls">
+        <button id="sh15-start" class="primary" disabled>Start</button>
+        <button id="sh15-stop" class="warn" disabled>Stop</button>
+        <button id="sh15-export" disabled>Export CSV</button>
+        <button id="sh15-clear">Clear</button>
+      </div>
+    </div>
+    <div id="sh15-dock"></div>
+    <div class="footer"><div id="sh15-progress" class="tiny">Detecting warehouse…</div></div>
+  </section>
+  `;
+
+  resultsRoot.innerHTML = `
+  <section id="sh15r">
+    <header id="sh15r-drag" title="Drag to move • Double-click to toggle mini mode">
+      <strong><span class="full-title">Results</span><span class="mini-title">Results (minimized)</span></strong>
+      <div style="display:flex; gap:8px; align-items:center;">
+        <span id="sh15r-counter" style="font-size:12px; opacity:.9;"></span>
+        <button id="sh15r-min" title="Minimize">–</button>
+        <button id="sh15r-x" title="Dock results">⤺</button>
+      </div>
+    </header>
+    <div class="body"><div id="sh15r-table-wrap"></div></div>
+    <div class="footer"><span class="tiny">Tip: Press “R” to toggle this window</span></div>
+  </section>
+  `;
+
+  document.body.appendChild(root);
+  document.body.appendChild(resultsRoot);
+
+  // ---- DOM refs / persistence ----
+  const $ = (s,p=document)=>p.querySelector(s);
+
+  const ui = {
+    // Control window
+    shell: $('#sh15'), drag: $('#sh15-drag'),
+    input: $('#sh15-input'), wh: $('#sh15-warehouse'),
+    start: $('#sh15-start'), stop: $('#sh15-stop'), exportBtn: $('#sh15-export'),
+    dock: $('#sh15-dock'), progress: $('#sh15-progress'),
+    min: $('#sh15-min'), x: $('#sh15-x'),
+    po: $('#sh15-po'), importBtn: $('#sh15-import'), importStatus: $('#sh15-import-status'),
+    detach: $('#sh15-detach'), autoopen: $('#sh15-autoopen'),
+    clear: $('#sh15-clear'),
+
+    // Results window
+    rshell: $('#sh15r'), rdrag: $('#sh15r-drag'),
+    rwrap: $('#sh15r-table-wrap'), rmin: $('#sh15r-min'), rx: $('#sh15r-x'), rcounter: $('#sh15r-counter'),
+  };
+
+  const PFX='sh15.';   // control
+  const PFXR='sh15r.'; // results
+  const save=(k,v)=>localStorage.setItem(k,v);
+  const load=(k,d='')=>localStorage.getItem(k)??d;
+
+  // Restore inputs/options
+  ui.input.value = load(PFX+'barcodes','');
+  ui.po.value    = load(PFX+'po','');
+  ui.input.addEventListener('input', ()=>{ save(PFX+'barcodes', ui.input.value); updateStartEnabled(); });
+  ui.po.addEventListener('input',    ()=>{ save(PFX+'po', ui.po.value); });
+
+  ui.detach.checked   = load(PFX+'opt.detached','0') === '1';
+  ui.autoopen.checked = load(PFX+'opt.autoopen','0') === '1';
+  ui.detach.addEventListener('change', ()=>{ save(PFX+'opt.detached', ui.detach.checked?'1':'0'); ensureResultsHost(); });
+  ui.autoopen.addEventListener('change', ()=>save(PFX+'opt.autoopen', ui.autoopen.checked?'1':'0'));
+
+  // ---- Progress / Start-button gating
+  let totalCount = 0, processedCount = 0;
+  function setProgress(msg){
+    const base = `${processedCount}/${totalCount}`;
+    ui.progress.textContent = msg ? `${base} — ${msg}` : base;
+    if (ui.rcounter) ui.rcounter.textContent = base;
+  }
+  function updateStartEnabled(){
+    const hasWH   = !!ui.wh.value.trim();
+    const hasASIN = parseBarcodes(ui.input.value).length > 0;
+    ui.start.disabled = !(hasWH && hasASIN);
+  }
+  updateStartEnabled();
+
+  // ---- Create one table; move it between dock and pop-out ----
+  const tableWrap = document.createElement('div');
+  tableWrap.id = 'sh15-table-wrap';
+  const table = document.createElement('table');
+  table.className = 'sh15-table';
+  table.innerHTML = `<thead><tr>
+    <th>ASIN</th><th class="sh15-title">Title</th><th>Slotted</th><th>Slot Size</th><th>Home Slot</th><th>PO</th><th>Status</th>
+  </tr></thead><tbody id="sh15-tbody"></tbody>`;
+  tableWrap.appendChild(table);
+  const tbody = table.querySelector('#sh15-tbody');
+
+  function ensureResultsHost() {
+    if (ui.detach.checked) {
+      if (!ui.rwrap.contains(tableWrap)) ui.rwrap.appendChild(tableWrap);
+      ui.rshell.style.display = 'flex';
+    } else {
+      if (!ui.dock.contains(tableWrap)) ui.dock.appendChild(tableWrap);
+      ui.rshell.style.display = 'none';
+    }
+  }
+  (ui.detach.checked ? ui.rwrap : ui.dock).appendChild(tableWrap);
+  ui.rshell.style.display = ui.detach.checked ? 'flex' : 'none';
+
+  // ---- Dragging + Size persistence + true mini-mode (both panels)
+  function bindPanel(panel, header, keyPrefix, defaults){
+    (function init(){
+      const collapsed = load(keyPrefix+'collapsed','0') === '1';
+      const w = Number(load(keyPrefix+'w', defaults.w));
+      const h = Number(load(keyPrefix+'h', defaults.h));
+      const l = load(keyPrefix+'l', null), t = load(keyPrefix+'t', null);
+
+      panel.style.right = '';
+      panel.style.bottom = '';
+
+      if (!collapsed) {
+        if (w) panel.style.width  = Math.max(defaults.minW, w) + 'px';
+        if (h) panel.style.height = Math.max(defaults.minH, h) + 'px';
+      }
+      if (l !== null && t !== null) {
+        panel.style.left = Math.max(0, Math.min(window.innerWidth - (panel.offsetWidth||defaults.w), Number(l))) + 'px';
+        panel.style.top  = Math.max(0, Math.min(window.innerHeight - 40, Number(t))) + 'px';
+      } else {
+        panel.style.left = defaults.left;
+        panel.style.top  = defaults.top;
+      }
+      if (collapsed) panel.classList.add('collapsed');
+
+      const ro = new ResizeObserver(() => {
+        if (!panel.classList.contains('collapsed')) {
+          save(keyPrefix+'w', parseInt(getComputedStyle(panel).width, 10));
+          save(keyPrefix+'h', parseInt(getComputedStyle(panel).height, 10));
+        }
+      });
+      ro.observe(panel);
+
+      window.addEventListener('resize', ()=>{
+        const r=panel.getBoundingClientRect();
+        let L=Math.max(0, Math.min(window.innerWidth-panel.offsetWidth, r.left));
+        let T=Math.max(0, Math.min(window.innerHeight-40, r.top));
+        panel.style.left = `${L}px`; panel.style.top = `${T}px`;
+        save(keyPrefix+'l', Math.round(L)); save(keyPrefix+'t', Math.round(T));
+      });
+    })();
+
+    (function enableDrag(){
+      let dragging=false, sx=0, sy=0, sl=0, st=0;
+      header.addEventListener('mousedown', (e)=>{
+        if (e.target.closest('button')) return;
+        dragging=true; sx=e.clientX; sy=e.clientY; const r=panel.getBoundingClientRect(); sl=r.left; st=r.top;
+        document.addEventListener('mousemove', move); document.addEventListener('mouseup', up, {once:true});
+        e.preventDefault();
+      });
+      function move(e){
+        if(!dragging) return;
+        let nl=sl+(e.clientX-sx), nt=st+(e.clientY-sy);
+        nl=Math.max(0, Math.min(window.innerWidth-panel.offsetWidth, nl));
+        nt=Math.max(0, Math.min(window.innerHeight-40, nt));
+        panel.style.left = `${nl}px`; panel.style.top = `${nt}px`;
+      }
+      function up(){
+        dragging=false; const r=panel.getBoundingClientRect();
+        save(keyPrefix+'l', Math.round(r.left)); save(keyPrefix+'t', Math.round(r.top));
+        document.removeEventListener('mousemove', move);
+      }
+    })();
+
+    function toggleMini(){
+      const nowCollapsed = !panel.classList.contains('collapsed');
+      if (nowCollapsed) {
+        save(keyPrefix+'w', parseInt(getComputedStyle(panel).width, 10));
+        save(keyPrefix+'h', parseInt(getComputedStyle(panel).height, 10));
+      }
+      panel.classList.toggle('collapsed');
+      save(keyPrefix+'collapsed', panel.classList.contains('collapsed') ? '1' : '0');
+    }
+    header.addEventListener('dblclick', toggleMini);
+    return { toggleMini };
+  }
+
+  const ctrlPanel = bindPanel(ui.shell, ui.drag, PFX,  { w:460, h:560, minW:360, minH:320, left:`${Math.max(16, window.innerWidth-460-16)}px`, top:`16px` });
+  const resPanel  = bindPanel(ui.rshell, ui.rdrag, PFXR, { w:600, h:520, minW:420, minH:260, left:`${Math.max(16, window.innerWidth-600-500)}px`, top:`80px` });
+
+  // Header buttons for mini
+  ui.min.addEventListener('click', ()=>ctrlPanel.toggleMini());
+  ui.rmin.addEventListener('click', ()=>resPanel.toggleMini());
+  ui.rx.addEventListener('click', ()=>{ ui.detach.checked = false; save(PFX+'opt.detached','0'); ensureResultsHost(); });
+
+  // Close button hides both panels
+  ui.x.addEventListener('click', () => {
+    try { running = false; } catch {}
+    ui.shell.style.display = 'none';
+    ui.rshell.style.display = 'none';
+  });
+
+  // Keyboard quick toggle for results
+  document.addEventListener('keydown', (e)=>{
+    if (e.key.toLowerCase() === 'r') {
+      ui.detach.checked = !ui.detach.checked; save(PFX+'opt.detached', ui.detach.checked?'1':'0'); ensureResultsHost();
+    }
+  });
+
+  // ---- Warehouse detect ----
+  function parseWarehouseFromURL(path = location.pathname){
+    let m = path.match(/\/marauders-map\/([A-Z0-9-]+)\/sorting-hat/i);
+    if (m) return m[1];
+    m = path.match(/\/([A-Z0-9-]+)\/sorting-hat/i);
+    if (m) return m[1];
+    return '';
+  }
+  function setWH(val, source){
+    if (!val) return false;
+    const v = String(val).trim();
+    if (!v) return false;
+    if (ui.wh.value !== v) {
+      ui.wh.value = v; save(PFX+'warehouse', v);
+      setProgress(`Warehouse: ${v} (${source})`);
+    }
+    updateStartEnabled(); return true;
+  }
+  async function probeDOMForWH({tries=4, interval=350} = {}){
+    for (let i=0; i<tries; i++){
+      const inp = document.querySelector('#marauders-map-select-warehouse');
+      if (inp && setWH(inp.value, 'DOM')) return true;
+      const label = Array.from(document.querySelectorAll('label')).find(l=>/select warehouse/i.test(l.textContent||''));
+      if (label && label.htmlFor) {
+        const el = document.getElementById(label.htmlFor);
+        if (el && setWH(el.value, 'DOM-label')) return true;
+      }
+      const h4 = Array.from(document.querySelectorAll('h4')).map(n=>n.textContent||'').find(t=>/sorting hat/i.test(t));
+      if (h4) {
+        const m = h4.match(/Sorting\s*Hat\s*-\s*([A-Z0-9-]+)/i);
+        if (m && setWH(m[1], 'header')) return true;
+      }
+      await sleep(interval);
+    }
+    return false;
+  }
+  function detectWarehouseId(){
+    const fromURL = parseWarehouseFromURL();
+    if (fromURL) { setWH(fromURL, 'URL'); return; }
+    const stored = load(PFX+'warehouse','');
+    if (stored)  { setWH(stored, 'stored'); return; }
+    setProgress('Detecting warehouse… (DOM fallback)');
+    probeDOMForWH().then(found=>{
+      if (!found) {
+        ui.wh.value = '';
+        setProgress('Warehouse not detected — open Sorting Hat and select a warehouse.');
+        updateStartEnabled();
+      }
+    });
+  }
+  detectWarehouseId();
+
+  // ---- PO/Title mapping state
+  const asinToPOs = new Map();
+  const asinToTitle = new Map();
+  const getPOsString = (asin) => {
+    const arr = asinToPOs.get((asin || '').toUpperCase());
+    return Array.isArray(arr) && arr.length ? arr.join(';') : '';
+  };
+  const getTitle = (asin) => asinToTitle.get((asin || '').toUpperCase()) || '';
+  function addTitleMapping(pairs) {
+    if (!Array.isArray(pairs)) return;
+    pairs.forEach(({asin, title}) => {
+      const key = (asin || '').toUpperCase();
+      if (!key) return;
+      if (title && !asinToTitle.has(key)) asinToTitle.set(key, String(title));
+    });
+  }
+
+  // ---- Table / CSV
+  function escHtml(s=''){ return String(s).replace(/[&<>"']/g, m=>({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[m])); }
+
+  function addRow(rec){
+    const tr=document.createElement('tr');
+    const status = rec.ok ? '<span class="pill ok" title="ok">✓</span>' : '<span class="pill bad" title="fail">✗</span>';
+    const isYes = rec.is_slotted === true;
+    const isNo  = rec.is_slotted === false;
+    const slottedText = isYes ? 'yes' : isNo ? 'no' : '';
+    const homeSlotText = isNo ? 'n/a' : (rec.home_slot || '');
+    const posStr = getPOsString(rec.asin);
+
+    const asin = (rec.asin || '').toUpperCase();
+    const whForLink = (ui.wh.value || '').trim();
+    const asinHref = asin && whForLink ? fcresearchUrl(whForLink, asin) : '';
+    const asinCell = asinHref
+      ? `<a href="${asinHref}" target="_blank" rel="noopener noreferrer">${asin}</a>`
+      : asin;
+
+    const title = getTitle(rec.asin);
+    const titleSafe = escHtml(title);
+    const needsToggle = title && title.length > 120;
+    const titleCell = `
+      <div class="t" title="${escHtml(title)}">${titleSafe}</div>
+      ${needsToggle ? '<span class="moreless" data-act="toggle">more</span>' : ''}
+    `;
+
+    tr.innerHTML=`
+      <td>${asinCell}</td>
+      <td class="sh15-title">${titleCell}</td>
+      <td>${slottedText}</td>
+      <td>${rec.slot_size||''}</td>
+      <td>${homeSlotText}</td>
+      <td>${posStr}</td>
+      <td>${status}</td>`;
+    tbody.appendChild(tr);
+
+    if (needsToggle) {
+      const tDiv = tr.querySelector('.sh15-title .t');
+      const toggle = tr.querySelector('.sh15-title .moreless');
+      if (tDiv && toggle) {
+        toggle.addEventListener('click', ()=>{
+          const exp = tDiv.classList.toggle('expanded');
+          toggle.textContent = exp ? 'less' : 'more';
+        });
+      }
+    }
+  }
+
+  // >>> CSV now includes Title (full text when available)
+  function toCSV(rows){
+    const headers=['asin','title','slotted','slot_size','home_slot','po']; // Status intentionally omitted
+    const esc=v=>v==null?'':(/[",\n]/.test(String(v))?`"${String(v).replace(/"/g,'""')}"`:String(v));
+    const get=(r,k)=>k==='asin'? (r.asin??'')
+      : k==='title'? getTitle(r.asin)
+      : k==='slotted'? (r.is_slotted === true ? 'TRUE' : r.is_slotted === false ? 'FALSE' : '')
+      : k==='slot_size'? (r.slot_size ?? '')
+      : k==='home_slot'? (r.is_slotted === false ? 'n/a' : (r.home_slot ?? ''))
+      : /* po */ getPOsString(r.asin);
+    return [headers.join(',')].concat(rows.map(r=>headers.map(h=>esc(get(r,h))).join(','))).join('\n');
+  }
+  function download(name,text){
+    const blob=new Blob([text],{type:'text/csv;charset=utf-8;'}); const url=URL.createObjectURL(blob);
+    const a=document.createElement('a'); a.href=url; a.download=name; document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(url);
+  }
+
+  // ---- Networking core (retries/backoff/breaker/timeout) ----
+  function isRetryable(rec) {
+    if (rec.ok) return false;
+    if (rec.http_status === 429) return true;
+    if (rec.http_status === 'timeout' || rec.http_status === 'n/a') return true;
+    if (typeof rec.http_status === 'number' && rec.http_status >= 500 && rec.http_status < 600) return true;
+    return false;
+  }
+  function backoffDelay(attemptIdx){
+    const base = BACKOFF_BASE_MS * Math.pow(2, attemptIdx - 1);
+    const jitter = Math.floor(base * (Math.random()*0.4 - 0.2)); // ±20%
+    return Math.max(200, base + jitter);
+  }
+  async function requestOneWithTimeout(warehouseId, barcode){
+    const url = makeURL(warehouseId, barcode);
+    const ctrl = new AbortController();
+    const t = setTimeout(()=>ctrl.abort('timeout'), REQ_TIMEOUT_MS);
+    let res, data, text;
+    try {
+      res = await fetch(url, {
+        method: 'POST',
+        credentials: 'include',
+        mode: 'cors',
+        referrer: location.href,
+        headers: { 'Accept': '*/*', 'Content-Type': 'application/json', 'x-amzn-trace-id': genTraceId() },
+        body: JSON.stringify({ method: 'GET' }),
+        signal: ctrl.signal
+      });
+    } catch (e) {
+      clearTimeout(t);
+      const why = (e && String(e).includes('timeout')) ? 'timeout' : 'n/a';
+      return { ok:false, http_status:why, error:String(e), asin: String(barcode||'').toUpperCase() };
+    }
+    clearTimeout(t);
+    try { data = await res.clone().json(); } catch { data = null; }
+    if (!res.ok) {
+      try { text = await res.clone().text(); } catch {}
+      return { ok:false, http_status:res.status, error:`HTTP ${res.status}${text?`: ${text.slice(0,200)}`:''}`, asin: String(barcode||'').toUpperCase() };
+    }
+    const payload = data && data.result ? data.result.data : null;
+    if (!payload) {
+      try { text = await res.clone().text(); } catch {}
+      return { ok:false, http_status:res.status, error:`Unexpected JSON${text?`: ${text.slice(0,200)}`:''}`, asin: String(barcode||'').toUpperCase() };
+    }
+    return {
+      ok:true, http_status:res.status,
+      asin: (payload.asin ?? String(barcode||'')).toUpperCase(),
+      is_slotted: payload.is_slotted,
+      slot_size: payload.slot_size ?? '',
+      home_slot: payload.home_slot ?? ''
+    };
+  }
+  let consecutiveServerErrs = 0;
+
+  async function requestWithRetries(warehouseId, code){
+    let last = null;
+    for (let i=0; i<=MAX_RETRIES; i++){
+      last = await requestOneWithTimeout(warehouseId, code);
+      if (last.ok) return last;
+      if (!isRetryable(last) || i === MAX_RETRIES) return last;
+      const d = backoffDelay(i+1);
+      setProgress(`Retry ${code} in ${Math.ceil(d/1000)}s (HTTP ${last.http_status || 'n/a'})…`);
+      await sleep(d);
+    }
+    return last;
+  }
+
+  // ---- Runner with breaker, jitter, multi-pass requeue ----
+  const results=[]; let running=false;
+  const firstPassSeen = new Set();
+
+  async function runBatch(){
+    const initialCodes = parseBarcodes(ui.input.value);
+    const wh    = (ui.wh.value || '').trim();
+
+    if(!wh) { alert('Warehouse not detected yet. Navigate to Sorting Hat and select a warehouse.'); return; }
+    if(!initialCodes.length) { alert('Paste at least one barcode.'); return; }
+
+    if (ui.detach.checked || ui.autoopen.checked) {
+      ui.detach.checked = true; save(PFX+'opt.detached','1'); ensureResultsHost();
+    }
+
+    running=true; ui.start.disabled=true; ui.stop.disabled=false; ui.exportBtn.disabled=true;
+    tbody.innerHTML=''; results.length=0; consecutiveServerErrs = 0;
+    totalCount = initialCodes.length; processedCount = 0; firstPassSeen.clear();
+    setProgress('Starting…');
+
+    let pending = initialCodes.slice();
+    for (let pass = 0; running && pass <= PASSES_FOR_REQUEUE; pass++){
+      const retryableNextPass = [];
+
+      for (let i=0; i<pending.length && running; i++){
+        if (consecutiveServerErrs >= BREAKER_THRESHOLD) {
+          setProgress(`Cooling ${Math.round(BREAKER_COOLDOWN_MS/1000)}s (service errors)…`);
+          await sleep(BREAKER_COOLDOWN_MS);
+          consecutiveServerErrs = 0;
+        }
+
+        const code=pending[i];
+        const rec = await requestWithRetries(wh, code);
+
+        if (!firstPassSeen.has(code)) {
+          firstPassSeen.add(code);
+          processedCount++;
+        }
+
+        if (!rec.ok && isRetryable(rec)) consecutiveServerErrs++;
+        else if (rec.ok) consecutiveServerErrs = 0;
+
+        results.push(rec); addRow(rec);
+        setProgress('Working…');
+
+        if (!rec.ok && isRetryable(rec)) retryableNextPass.push(code);
+
+        if (i < pending.length-1 && running) {
+          await sleep(withJitter(BASE_DELAY_MS));
+        }
+      }
+
+      if (!running) break;
+      if (!retryableNextPass.length) break;
+
+      if (pass < PASSES_FOR_REQUEUE) {
+        setProgress(`Cooling before retry pass… ${Math.round(PASS_COOLDOWN_MS/1000)}s`);
+        await sleep(PASS_COOLDOWN_MS);
+        pending = retryableNextPass;
+      }
+    }
+
+    running=false; updateStartEnabled(); ui.stop.disabled=true;
+    ui.exportBtn.disabled = results.length === 0;
+    setProgress('Done ✓');
+  }
+
+  // ---- Multi-PO background handoff (FCResearch) ----
+  const openTabs = Object.create(null);
+  const timers = Object.create(null);
+
+  function makeChannel(){ return 'c' + Date.now().toString(36) + Math.random().toString(16).slice(2); }
+  function fcresearchUrlForPO(wh, po, channel){
+    const base = `https://fcresearch-na.aka.amazon.com/${encodeURIComponent(wh)}/results?s=${encodeURIComponent(po)}`;
+    return `${base}#shBridge=${encodeURIComponent(channel)}`;
+  }
+  function setImportStatus(msg){ ui.importStatus.textContent = msg || ''; }
+  function mergeASINsIntoTextarea(list) {
+    const existing = parseBarcodes(ui.input.value);
+    const add = Array.from(new Set(list));
+    const merged = Array.from(new Set([...add, ...existing]));
+    ui.input.value = merged.join('\n');
+    save(PFX+'barcodes', ui.input.value);
+    updateStartEnabled();
+  }
+  function addMapping(asinArr, po) {
+    asinArr.forEach(a => {
+      const key = (a || '').toUpperCase();
+      if (!key) return;
+      const arr = asinToPOs.get(key) || [];
+      if (!arr.includes(po)) arr.push(po);
+      asinToPOs.set(key, arr);
+    });
+  }
+
+  function awaitPOImport(wh, po){
+    return new Promise((resolve) => {
+      const channel = makeChannel();
+      const resKey = `sh15.poRes.${channel}`;
+      let cleaned = false;
+
+      const clean = (tabHandle, listenerId, timeoutId) => {
+        if (cleaned) return; cleaned = true;
+        if (timeoutId) { clearTimeout(timeoutId); }
+        if (tabHandle && typeof tabHandle.close === 'function') { try { tabHandle.close(); } catch {} }
+        if (listenerId) { try { GM_removeValueChangeListener(listenerId); } catch {} }
+      };
+
+      const listenerId = GM_addValueChangeListener(resKey, (name, oldVal, newVal, remote) => {
+        if (!remote || !newVal) return;
+        clean(openTabs[channel], listenerId, timers[channel]); delete timers[channel]; delete openTabs[channel];
+        resolve({ type:'done', data:newVal, po });
+      });
+
+      const url = fcresearchUrlForPO(wh, po, channel);
+      const tab = GM_openInTab(url, { active: false, insert: true, setParent: true });
+      openTabs[channel] = tab;
+
+      timers[channel] = setTimeout(() => {
+        clean(tab, listenerId, timers[channel]); delete timers[channel]; delete openTabs[channel];
+        resolve({ type:'timeout', po });
+      }, IMPORT_TIMEOUT_MS);
+    });
+  }
+
+  ui.importBtn.addEventListener('click', async () => {
+    try {
+      const rawPOs = (ui.po.value || '').trim();
+      const wh = (ui.wh.value || '').trim();
+      if (!rawPOs) { setImportStatus('Enter at least one PO.'); return; }
+      if (!wh) { setImportStatus('Warehouse not detected yet.'); return; }
+
+      const pos = parsePOs(rawPOs);
+      if (!pos.length) { setImportStatus('No valid PO tokens found.'); return; }
+
+      let okCount=0, failCount=0, importCount=0;
+      setImportStatus(`Importing ${pos.length} PO(s)…`);
+
+      for (let i=0; i<pos.length; i++){
+        const po = pos[i];
+        setImportStatus(`Importing PO ${i+1}/${pos.length}: ${po} …`);
+        const res = await awaitPOImport(wh, po);
+
+        if (res.type === 'timeout') {
+          failCount++;
+          setImportStatus(`Login required or no response for ${po}. Please sign in to FC Menu and retry.`);
+        } else if (res.type === 'done') {
+          const payload = res.data;
+          if (payload.loginRequired) {
+            failCount++;
+            setImportStatus(`Login required for ${po}. Sign in to FC Menu (…/openid/login) then retry.`);
+          } else if (payload.ok && Array.isArray(payload.asins) && payload.asins.length) {
+            if (Array.isArray(payload.pairs) && payload.pairs.length) addTitleMapping(payload.pairs);
+            addMapping(payload.asins, po);
+            mergeASINsIntoTextarea(payload.asins);
+            okCount++; importCount += payload.asins.length;
+            setImportStatus(`Imported ${payload.asins.length} from ${po} (${i+1}/${pos.length}).`);
+          } else {
+            failCount++;
+            setImportStatus(`No ASINs found for ${po}.`);
+          }
+        }
+
+        if (i < pos.length-1) await sleep(PO_DELAY_MS);
+      }
+
+      setImportStatus(`PO import finished: ${okCount} ok, ${failCount} failed. Added ${importCount} ASIN(s).`);
+    } catch (err) {
+      setImportStatus(`Import error: ${err}`);
+      console.error('[SH Bulk] Import error:', err);
+    }
+  });
+
+  // ---- Main buttons ----
+  ui.start.addEventListener('click', runBatch);
+  ui.stop.addEventListener('click', ()=>{ running=false; setProgress('Stopping…'); });
+  ui.exportBtn.addEventListener('click', ()=>{
+    const csv=toCSV(results);
+    const ts=new Date().toISOString().replace(/[:.]/g,'-');
+    download(`sorting-hat-results-${ts}.csv`, csv);
+  });
+  function clearAll() {
+    try { running = false; } catch {}
+    ui.input.value = ''; ui.po.value = '';
+    save(PFX+'barcodes',''); save(PFX+'po','');
+    try { asinToPOs.clear(); } catch {}
+    try { asinToTitle.clear(); } catch {}
+    try { results.length = 0; } catch {}
+    try { tbody.innerHTML = ''; } catch {}
+    processedCount = 0; totalCount = 0;
+    setProgress('Ready');
+    ui.exportBtn.disabled = true; ui.stop.disabled = true;
+    updateStartEnabled();
+    setImportStatus('');
+  }
+  ui.clear.addEventListener('click', clearAll);
+
+})();
+// ==UserScript==
+// @name         New Userscript
+// @namespace    http://tampermonkey.net/
+// @version      2025-12-11
+// @description  try to take over the world!
+// @author       You
+// @match        https://*/*
+// @icon         data:image/gif;base64,R0lGODlhAQABAAAAACH5BAEKAAEALAAAAAABAAEAAAICTAEAOw==
+// @grant        none
+// ==/UserScript==
+
+(function() {
+    'use strict';
+
+    // Your code here...
+})();
