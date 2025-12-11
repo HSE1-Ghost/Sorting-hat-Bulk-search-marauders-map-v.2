@@ -1,8 +1,11 @@
+
 // ==UserScript==
 // @name         Sorting Hat: Bulk Search ASINs and POs
 // @namespace    https://tampermonkey.net/
 // @version      2.3.1
 // @description  Bulk search ASINs in Sorting Hat. Pull ASINS from POs from FCResearch and bulk search. Being logged into FCMenu is required to pull from POs.
+// @downloadURL  https://raw.githubusercontent.com/HSE1-Ghost/Sorting-Hat-Bulk-Search/main/sorting-hat-bulk-search.user.js
+// @updateURL    https://raw.githubusercontent.com/HSE1-Ghost/Sorting-Hat-Bulk-Search/main/sorting-hat-bulk-search.user.js
 // @match        https://iris-diagonalley.agl.amazon.dev/dc-marauders-map/HSE1/sorting-hat
 // @match        https://fcresearch-na.aka.amazon.com/*/results*
 // @run-at       document-idle
